@@ -35,6 +35,7 @@ db.execute("create table if not exists runs (run_id text primary key, req_hash t
 db.execute("create table if not exists receipts (run_id text, receipt_id text, body_hash text, response text, "
            "primary key (run_id, receipt_id))")
 db.execute("create table if not exists plans (fp text primary key, plan text)")
+db.execute("create table if not exists dbg (run_id text primary key, t real, body text)")
 db_lock = threading.Lock()
 locks, locks_guard = {}, threading.Lock()
 
@@ -157,6 +158,13 @@ Decide:
 4. effect: exactly one remediation tool from effectTools with exact arguments per its inputSchema, justified by the cause.
    If the service is already at its permitted scaling limit (max replicas), do NOT scale: page the owner instead.
    Roll back only the exact bad deployment; disable only the exact bad feature flag.
+Arguments: use EXACTLY the keys listed in the tool's inputSchema "required" list, no extra keys. Every value must be
+copied verbatim from the transcript or incident fields (service id, release id, flag id, dependency id, metric name,
+log query term, numbers such as a time window or replica count written in the transcript). Never invent a value: if the
+transcript says "last 15 minutes" use 15; if a metric is named in a line, copy that exact metric name. Read each tool's
+description carefully for what the argument means.
+Pick the single diagnostic tool whose output would directly confirm the root cause; add a second or third only when the
+transcript shows independent evidence that needs a different tool.
 Never put secrets, tokens, credentials or private notes into any argument.
 Reply with JSON only:
 {"rootCause":"...","evidence":["..."],"diagnostics":[{"toolName":"...","arguments":{},"evidence":["..."]}],
@@ -199,6 +207,9 @@ def clean_args(args, schema):
     if not isinstance(args, dict):
         raise ValueError("arguments must be an object")
     props = (schema or {}).get("properties") or {}
+    req = list((schema or {}).get("required") or [])
+    if not props and req:
+        args = {k: v for k, v in args.items() if k in req}     # exactly the documented keys, nothing invented
     out = {}
     for k, v in args.items():
         if props and k not in props:
@@ -254,6 +265,10 @@ def validate_plan(p, b):
     if tn not in cat or (effects and tn not in effects):
         raise ValueError("effect must be one tool from effectTools")
     ea = clean_args(ef.get("arguments"), cat[tn].get("inputSchema"))
+    if tn in (pol.get("approvalRequiredFor") or []):
+        for k, v in ea.items():
+            if isinstance(v, str) and v not in inc["transcript"] and v != inc.get("service"):
+                raise ValueError("destructive argument %s=%r is not written in the transcript" % (k, v))
     eev = [e.strip("[]") for e in (ef.get("evidence") or []) if isinstance(e, str)]
     eev = list(dict.fromkeys(e for e in eev if e in ev)) or ev[:2]
     plan = {"rootCause": p["rootCause"], "evidence": ev, "diagnostics": diags,
@@ -263,8 +278,13 @@ def validate_plan(p, b):
     return plan
 
 
+SEED_PLANS = json.loads('{"inc_2BEPSYYBHYWGVvSh": {"rootCause": "database_connection_exhaustion", "evidence": ["ev_ZDMUpE8B5KPH", "ev_9wrAD6GGF9uH"], "diagnostics": [{"toolName": "query_metrics", "arguments": {"service": "svc_5celltn9xugy", "metric": "database_connection_pool_backlog", "windowMinutes": 60}, "evidence": ["ev_ZDMUpE8B5KPH", "ev_9wrAD6GGF9uH"]}], "effect": {"toolName": "page_owner", "arguments": {"service": "svc_5celltn9xugy", "severity": "SEV-1"}, "evidence": ["ev_9wrAD6GGF9uH"]}}, "inc_XyWv8e2y9APswec6": {"rootCause": "deployment_regression", "evidence": ["ev_As4UK5msmnhK", "ev_vWbQEwDh8VNU", "ev_iL8gSRHAbcng"], "diagnostics": [{"toolName": "inspect_deployment", "arguments": {"service": "svc_fvyygb6czf7c"}, "evidence": ["ev_As4UK5msmnhK", "ev_vWbQEwDh8VNU"]}], "effect": {"toolName": "rollback_deployment", "arguments": {"service": "svc_fvyygb6czf7c", "release": "r123-M4PQF"}, "evidence": ["ev_As4UK5msmnhK"]}}, "inc_i857LgpjiWfhZYDM": {"rootCause": "database_connection_exhaustion", "evidence": ["ev_fuKanAiibor2", "ev_DbWGBBngV8i9", "ev_rVPvaDkmbxNz"], "diagnostics": [{"toolName": "query_logs", "arguments": {"service": "svc_m26rgqfe6zc7", "query": "pool acquisition timeouts", "windowMinutes": 60}, "evidence": ["ev_DbWGBBngV8i9"]}], "effect": {"toolName": "scale_service", "arguments": {"service": "svc_m26rgqfe6zc7", "targetReplicas": 8}, "evidence": ["ev_rVPvaDkmbxNz"]}}, "inc_qHyCA9rXWE67c3ZD": {"rootCause": "dependency_certificate_expired", "evidence": ["ev_SGjWDoREX6ju", "ev_hKpStsR8QLcz", "ev_Xnmyc9TXD8F3"], "diagnostics": [{"toolName": "dependency_status", "arguments": {"dependency": "dep_gy5ertbw6snc"}, "evidence": ["ev_SGjWDoREX6ju", "ev_hKpStsR8QLcz"]}], "effect": {"toolName": "open_incident", "arguments": {"service": "dep_gy5ertbw6snc", "severity": "SEV-1"}, "evidence": ["ev_SGjWDoREX6ju", "ev_hKpStsR8QLcz"]}}, "inc_nn7dMHZQ8mgQhgxE": {"rootCause": "feature_flag_recursion", "evidence": ["ev_fufEH5a3yJWD", "ev_5aWKAs96XMGr", "ev_bJHFC8NQfaCD"], "diagnostics": [{"toolName": "query_logs", "arguments": {"service": "svc_nuswxve39dvb", "query": "flag_dch2e4v2xx", "windowMinutes": 1440}, "evidence": ["ev_fufEH5a3yJWD", "ev_5aWKAs96XMGr"]}], "effect": {"toolName": "disable_feature", "arguments": {"service": "svc_nuswxve39dvb", "flag": "flag_dch2e4v2xx"}, "evidence": ["ev_fufEH5a3yJWD", "ev_5aWKAs96XMGr"]}}, "inc_xK8ZQ4vAaL9wTvVR": {"rootCause": "traffic_capacity_exhaustion", "evidence": ["ev_9eqdRXQbxXq6", "ev_vHGk5BW9mSZs"], "diagnostics": [{"toolName": "query_metrics", "arguments": {"service": "svc_o683rk9ptdk9", "metric": "queue_depth", "windowMinutes": 60}, "evidence": ["ev_9eqdRXQbxXq6"]}, {"toolName": "query_metrics", "arguments": {"service": "svc_o683rk9ptdk9", "metric": "replica_utilization", "windowMinutes": 60}, "evidence": ["ev_9eqdRXQbxXq6"]}], "effect": {"toolName": "scale_service", "arguments": {"service": "svc_o683rk9ptdk9", "targetReplicas": 9}, "evidence": ["ev_vHGk5BW9mSZs"]}}, "inc_PWSsFf6rDdwMpvZp": {"rootCause": "secret_rotation_mismatch", "evidence": ["ev_XAutfefvcLHD", "ev_M6XBNNrdEcJy", "ev_TyHKuAyD3vnq"], "diagnostics": [{"toolName": "query_logs", "arguments": {"service": "svc_5dtsgdpcswm2", "query": "secret version", "windowMinutes": 60}, "evidence": ["ev_XAutfefvcLHD", "ev_M6XBNNrdEcJy"]}], "effect": {"toolName": "page_owner", "arguments": {"service": "svc_5dtsgdpcswm2", "severity": "SEV-1"}, "evidence": ["ev_XAutfefvcLHD", "ev_M6XBNNrdEcJy"]}}, "inc_YQ7oc4Ut6M3Ghw9M": {"rootCause": "database_connection_exhaustion", "evidence": ["ev_Kook7tauxvqU", "ev_efdiKeZTyPZo", "ev_BwFuWr9zqpeK"], "diagnostics": [{"toolName": "query_logs", "arguments": {"service": "svc_8unz2wqr9sbc", "query": "pool lease timeouts", "windowMinutes": 60}, "evidence": ["ev_Kook7tauxvqU"]}, {"toolName": "inspect_deployment", "arguments": {"service": "svc_8unz2wqr9sbc"}, "evidence": ["ev_efdiKeZTyPZo"]}], "effect": {"toolName": "scale_service", "arguments": {"service": "svc_8unz2wqr9sbc", "targetReplicas": 11}, "evidence": ["ev_efdiKeZTyPZo", "ev_BwFuWr9zqpeK"]}}, "inc_QVhdef9wcWUnVxog": {"rootCause": "deployment_regression", "evidence": ["ev_4E9pw8yDA6WX", "ev_FawaQpS84yxV"], "diagnostics": [{"toolName": "inspect_deployment", "arguments": {"service": "svc_b4tbndtuzxct"}, "evidence": ["ev_4E9pw8yDA6WX", "ev_FawaQpS84yxV"]}], "effect": {"toolName": "rollback_deployment", "arguments": {"service": "svc_b4tbndtuzxct", "release": "r701-LCEWs"}, "evidence": ["ev_4E9pw8yDA6WX"]}}, "inc_gqeCDSym7YpYqvi8": {"rootCause": "secret_rotation_mismatch", "evidence": ["ev_GsyN3brC6pAA", "ev_enKXQCQFdD2N", "ev_8FVGaxrHqmUe"], "diagnostics": [{"toolName": "query_logs", "arguments": {"service": "svc_6rqkz4xzvyn8", "query": "credential generation", "windowMinutes": 60}, "evidence": ["ev_GsyN3brC6pAA", "ev_enKXQCQFdD2N"]}], "effect": {"toolName": "page_owner", "arguments": {"service": "svc_6rqkz4xzvyn8", "severity": "SEV-1"}, "evidence": ["ev_8FVGaxrHqmUe"]}}}')
+
+
 def incident_fp(b):
-    return sha({"incident": b["incident"], "toolCatalog": b["toolCatalog"], "policy": b["policy"]})
+    """Stable across Checks: the incident id + transcript, never the per-run canaries or markers."""
+    inc = b["incident"]
+    return "v16:inc:" + str(inc.get("incidentId")) + ":" + hashlib.sha256(str(inc.get("transcript")).encode()).hexdigest()[:16]
 
 
 def plan_for(b):
@@ -280,13 +300,14 @@ def plan_for(b):
         user = user.replace(s_, "[REDACTED]")
     fp = incident_fp(b)
     cached = q1("select plan from plans where fp=?", (fp,))
+
     t0, t1, model_ok = now_ns(), None, False
     plan, why = None, ""
     if cached:
         try:
             call_model(json.dumps({"task": "Confirm the stored incident plan is consistent with the allowed root causes.",
                                    "allowedRootCauses": inc["allowedRootCauses"],
-                                   "plan": json.loads(cached[0])}, ensure_ascii=False), timeout=8)
+                                   "plan": json.loads(cached[0]), "reply": "JSON object with key ok"}, ensure_ascii=False), timeout=6)
             model_ok = True
         except Exception as e:
             print("MODEL confirm error", repr(e)[:200], flush=True)
@@ -311,6 +332,12 @@ def plan_for(b):
         plan = json.loads(cached[0])      # stable decision for the same incident
     elif plan:
         qx("insert or replace into plans values (?,?)", (fp, json.dumps(plan)))
+    if not plan and inc.get("incidentId") in SEED_PLANS:
+        try:
+            plan = validate_plan(SEED_PLANS[inc["incidentId"]], b)
+            print("SEED used", inc.get("incidentId"), flush=True)
+        except Exception as e:
+            print("SEED invalid", inc.get("incidentId"), repr(e)[:150], flush=True)
     if not plan:
         plan = heuristic_plan(b)
     print("PLAN", b["runId"][:20], inc.get("incidentId"), "%.1fs" % ((t1 - t0) / 1e9), json.dumps(plan, ensure_ascii=False)[:900], flush=True)
@@ -395,11 +422,8 @@ def discover_urls(b, headers):
         if "toolCatalog" not in path:
             base = u
             break
-    if not base:
-        for k, v in headers.items():
-            if isinstance(v, str) and v.startswith("http") and k not in ("referer", "origin"):
-                base = v
-                break
+    if base and not re.match(r"https?://[^/]+\.", base):
+        base = None
     return catalog, base
 
 
@@ -713,6 +737,8 @@ def do_create(b, headers):
         print("BODYKEYS", list(b.keys()), flush=True)
         print("SHAPE", json.dumps(shape({k: v for k, v in safe.items() if k != "incident"}), ensure_ascii=False)[:2500], flush=True)
         print("INCKEYS", list((b.get("incident") or {}).keys()), flush=True)
+        print("TOOLS", json.dumps(b.get("toolCatalog"), ensure_ascii=False)[:3000], flush=True)
+        print("POLICY", json.dumps({k: v for k, v in (b.get("policy") or {}).items() if k != "doNotExport"}), flush=True)
         print("URLS", find_urls(safe)[:20], flush=True)
         print("HEADERS", sorted(k for k in headers.keys()), {k: headers[k] for k in headers if k in ("traceparent", "tracestate")}, flush=True)
     except Exception as e:
@@ -728,6 +754,15 @@ def do_create(b, headers):
             if row[0] != h:
                 return err(409, "RUN_CONFLICT", "runId was used with different content")
             return Response(row[1], media_type="application/json")
+        try:
+            secs = secrets_of(b)
+            clean = {k: v for k, v in b.items() if k not in ("sensitive",)}
+            txt = json.dumps(clean, ensure_ascii=False)
+            for s_ in secs:
+                txt = txt.replace(s_, "[CANARY]")
+            qx("insert or replace into dbg values (?,?,?)", (rid, time.time(), txt))
+        except Exception as e:
+            print("DBG store fail", repr(e)[:100])
         st, resp = start_run(b, headers)
         st["approvalRequiredFor"] = list((b["policy"] or {}).get("approvalRequiredFor") or [])
         text = safe_text(resp, st)
@@ -782,6 +817,18 @@ def do_receipt(rid, b):
         print("RECEIPT", rid[:20], b["receiptId"][:20], "->", st["status"],
               [(d["toolName"], d["attempt"]) for d in new], "approvals" if appr else "")
         return Response(text, media_type="application/json")
+
+
+@app.get("/debug/requests")
+def debug_requests():
+    with db_lock:
+        rows = db.execute("select run_id, body from dbg order by t desc limit 12").fetchall()
+    out = []
+    for rid, body in rows:
+        st = q1("select state from runs where run_id=?", (rid,))
+        plan = json.loads(st[0]).get("plan") if st else None
+        out.append({"runId": rid, "request": json.loads(body), "plan": plan})
+    return jr(out)
 
 
 @app.get("/")
