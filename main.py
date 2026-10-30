@@ -11,6 +11,20 @@ MODEL_TIMEOUT = float(os.environ.get("MODEL_TIMEOUT", "14"))
 MAX_BODY = 4 * 1024 * 1024
 
 app = FastAPI(redirect_slashes=False)
+
+
+@app.middleware("http")
+async def normalize_path(request, call_next):
+    """Accept '//v2/incidents' (base URL submitted with a trailing slash) and a trailing '/'."""
+    p = request.scope.get("path", "")
+    q = re.sub(r"/{2,}", "/", p)
+    if len(q) > 1 and q.endswith("/"):
+        q = q[:-1]
+    if q != p:
+        request.scope["path"] = q
+        request.scope["raw_path"] = q.encode()
+    print("REQ", request.method, q, flush=True)
+    return await call_next(request)
 db = sqlite3.connect(os.environ.get("DB_PATH", "incidents.db"), check_same_thread=False)
 db.execute("create table if not exists runs (run_id text primary key, req_hash text, first_response text, state text)")
 db.execute("create table if not exists receipts (run_id text, receipt_id text, body_hash text, response text, "
@@ -144,11 +158,11 @@ Reply with JSON only:
  "effect":{"toolName":"...","arguments":{},"evidence":["..."]},"why":"one short sentence"}"""
 
 
-def call_model(user):
+def call_model(user, timeout=None):
     r = httpx.post(AI_URL + "/chat/completions", headers={"Authorization": "Bearer " + AI_KEY},
                    json={"model": AI_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
                          "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]},
-                   timeout=MODEL_TIMEOUT)
+                   timeout=timeout or MODEL_TIMEOUT)
     r.raise_for_status()
     return json.loads(r.json()["choices"][0]["message"]["content"])
 
@@ -270,11 +284,12 @@ def plan_for(b):
             plan = validate_plan(raw, b)
         except ValueError as e:
             why = str(e)
-            if not cached and time.time_ns() - t0 < 6e9:
-                raw = call_model(user + "\n\nYour previous answer was rejected: " + why + ". Fix it.")
+            left = 15.0 - (time.time_ns() - t0) / 1e9
+            if not cached and left > 5:
+                raw = call_model(user + "\n\nYour previous answer was rejected: " + why + ". Fix it.", timeout=left)
                 plan = validate_plan(raw, b)
     except Exception as e:
-        print("MODEL error", repr(e)[:200])
+        print("MODEL error", repr(e)[:300], flush=True)
     t1 = now_ns()
     if cached:
         plan = json.loads(cached[0])      # stable decision for the same incident
