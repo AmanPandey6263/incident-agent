@@ -5,7 +5,10 @@ from fastapi.responses import Response
 
 PROFILE = "ga5-incident-agent/v2"
 AI_URL = os.environ.get("AI_BASE_URL", "https://aipipe.org/openai/v1")
-AI_KEY = os.environ.get("AI_KEY", "")
+AI_KEY = (os.environ.get("AI_KEY") or os.environ.get("AIPIPE_TOKEN") or os.environ.get("OPENAI_API_KEY") or "").strip().strip('"').strip("'")
+if AI_KEY.lower().startswith("bearer "):
+    AI_KEY = AI_KEY[7:].strip()
+print("AI_KEY present:", bool(AI_KEY), "length", len(AI_KEY), "base", AI_URL, "model", os.environ.get("AI_MODEL", "gpt-4.1-mini"), flush=True)
 AI_MODEL = os.environ.get("AI_MODEL", "gpt-4.1-mini")
 MODEL_TIMEOUT = float(os.environ.get("MODEL_TIMEOUT", "14"))
 MAX_BODY = 4 * 1024 * 1024
@@ -307,7 +310,23 @@ def heuristic_plan(b):
     effects = set(pol.get("effectTools") or [])
     diag = next((t for t in cat if t["name"] not in effects), cat[0])
     eff = next((t for t in cat if t["name"] in effects), cat[-1])
-    fill = lambda t: {k: inc.get("service", "") for k in ((t.get("inputSchema") or {}).get("required") or [])}
+    def fill(t):
+        sch = t.get("inputSchema") or {}
+        props = sch.get("properties") or {}
+        out = {}
+        for k in sch.get("required") or []:
+            p = props.get(k) or {}
+            if "enum" in p and p["enum"]:
+                out[k] = p["enum"][0]
+            elif p.get("type") == "integer":
+                out[k] = int(p.get("default", p.get("minimum", 30)))
+            elif p.get("type") == "number":
+                out[k] = float(p.get("default", p.get("minimum", 30)))
+            elif p.get("type") == "boolean":
+                out[k] = bool(p.get("default", True))
+            else:
+                out[k] = inc.get("service", "")
+        return out
     print("HEURISTIC plan used")
     return {"rootCause": inc["allowedRootCauses"][0], "evidence": ids[:2],
             "diagnostics": [{"toolName": diag["name"], "arguments": fill(diag), "evidence": ids[:1]}],
