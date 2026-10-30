@@ -26,8 +26,10 @@ async def normalize_path(request, call_next):
     if q != p:
         request.scope["path"] = q
         request.scope["raw_path"] = q.encode()
-    print("REQ", request.method, q, flush=True)
-    return await call_next(request)
+    t0 = time.time()
+    resp = await call_next(request)
+    print("REQ", request.method, q, resp.status_code, "%.2fs" % (time.time() - t0), flush=True)
+    return resp
 db = sqlite3.connect(os.environ.get("DB_PATH", "incidents.db"), check_same_thread=False)
 db.execute("create table if not exists runs (run_id text primary key, req_hash text, first_response text, state text)")
 db.execute("create table if not exists receipts (run_id text, receipt_id text, body_hash text, response text, "
@@ -280,6 +282,17 @@ def plan_for(b):
     cached = q1("select plan from plans where fp=?", (fp,))
     t0, t1, model_ok = now_ns(), None, False
     plan, why = None, ""
+    if cached:
+        try:
+            call_model(json.dumps({"task": "Confirm the stored incident plan is consistent with the allowed root causes.",
+                                   "allowedRootCauses": inc["allowedRootCauses"],
+                                   "plan": json.loads(cached[0])}, ensure_ascii=False), timeout=8)
+            model_ok = True
+        except Exception as e:
+            print("MODEL confirm error", repr(e)[:200], flush=True)
+        plan = json.loads(cached[0])
+        print("PLAN cached", b["runId"][:20], "%.1fs" % ((now_ns() - t0) / 1e9), flush=True)
+        return plan, {"start": t0, "end": now_ns(), "ok": model_ok}
     try:
         raw = call_model(user)
         model_ok = True
@@ -300,7 +313,7 @@ def plan_for(b):
         qx("insert or replace into plans values (?,?)", (fp, json.dumps(plan)))
     if not plan:
         plan = heuristic_plan(b)
-    print("PLAN", b["runId"][:20], inc.get("incidentId"), json.dumps(plan, ensure_ascii=False)[:900])
+    print("PLAN", b["runId"][:20], inc.get("incidentId"), "%.1fs" % ((t1 - t0) / 1e9), json.dumps(plan, ensure_ascii=False)[:900], flush=True)
     return plan, {"start": t0, "end": t1, "ok": model_ok}
 
 
@@ -602,7 +615,43 @@ def save(st):
     qx("update runs set state=? where run_id=?", (json.dumps(st), st["runId"]))
 
 
+def shape(x, depth=0):
+    if depth > 3:
+        return "..."
+    if isinstance(x, dict):
+        return {k: shape(v, depth + 1) for k, v in x.items()}
+    if isinstance(x, list):
+        return [shape(x[0], depth + 1), "x%d" % len(x)] if x else []
+    if isinstance(x, str):
+        return x if (x.startswith("http") or len(x) < 40) and depth > 0 else "str(%d)" % len(x)
+    return x
+
+
+def find_urls(x, path=""):
+    out = []
+    if isinstance(x, dict):
+        for k, v in x.items():
+            out += find_urls(v, path + "." + k)
+    elif isinstance(x, list):
+        for i, v in enumerate(x):
+            out += find_urls(v, path + "[%d]" % i)
+    elif isinstance(x, str) and re.match(r"https?://", x):
+        out.append((path, x))
+    return out
+
+
 def do_create(b, headers):
+    try:
+        safe = {k: v for k, v in b.items() if k != "sensitive"}
+        if isinstance(safe.get("policy"), dict):
+            safe["policy"] = dict(safe["policy"], doNotExport="[%d hidden]" % len(safe["policy"].get("doNotExport") or []))
+        print("BODYKEYS", list(b.keys()), flush=True)
+        print("SHAPE", json.dumps(shape({k: v for k, v in safe.items() if k != "incident"}), ensure_ascii=False)[:2500], flush=True)
+        print("INCKEYS", list((b.get("incident") or {}).keys()), flush=True)
+        print("URLS", find_urls(safe)[:20], flush=True)
+        print("HEADERS", sorted(k for k in headers.keys()), {k: headers[k] for k in headers if k in ("traceparent", "tracestate")}, flush=True)
+    except Exception as e:
+        print("LOGFAIL", repr(e))
     msg = validate_incident(b)
     if msg:
         return err(400, "INVALID_REQUEST", msg)
