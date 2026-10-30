@@ -359,6 +359,67 @@ def parse_tp(tp):
     return m.group(1), m.group(2)
 
 
+# ------------------------------------------------------------------ outgoing tool calls
+URL_KEYS = ("url", "endpoint", "href", "invokeUrl", "invoke_url", "toolUrl", "tool_url", "callUrl", "uri", "target")
+
+
+def tool_url(st, tool):
+    cat = st.get("catalogUrls") or {}
+    if cat.get(tool):
+        u = cat[tool]
+    elif st.get("toolBase"):
+        u = st["toolBase"]
+    else:
+        return None
+    if "{toolName}" in u or "{tool}" in u or "{name}" in u:
+        return u.replace("{toolName}", tool).replace("{tool}", tool).replace("{name}", tool)
+    if cat.get(tool):
+        return u
+    u = u.rstrip("/")
+    if u.endswith("/tool") or u.endswith("/tools"):
+        return u + "/" + tool
+    return u + "/tool/" + tool
+
+
+def discover_urls(b, headers):
+    catalog = {}
+    for t in b.get("toolCatalog") or []:
+        for k in URL_KEYS:
+            v = t.get(k) if isinstance(t, dict) else None
+            if isinstance(v, str) and v.startswith("http"):
+                catalog[t["name"]] = v
+                break
+    base = None
+    found = find_urls({k: v for k, v in b.items() if k not in ("sensitive", "incident")})
+    for path, u in found:
+        if "toolCatalog" not in path:
+            base = u
+            break
+    if not base:
+        for k, v in headers.items():
+            if isinstance(v, str) and v.startswith("http") and k not in ("referer", "origin"):
+                base = v
+                break
+    return catalog, base
+
+
+def fire(st, d):
+    url = tool_url(st, d["toolName"])
+    if not url:
+        return
+    def run():
+        body = dict(d, runId=st["runId"])
+        hdr = {"traceparent": d["traceparent"], "content-type": "application/json"}
+        if d.get("tracestate"):
+            hdr["tracestate"] = d["tracestate"]
+        try:
+            r = httpx.post(url, json=body, headers=hdr, timeout=10)
+            print("TOOLCALL", d["toolName"], d["attempt"], url, r.status_code, r.text[:200].replace("\n", " "), flush=True)
+        except Exception as e:
+            print("TOOLCALL", d["toolName"], d["attempt"], url, "ERR", repr(e)[:150], flush=True)
+    threading.Thread(target=run, daemon=True).start()
+
+
 # ------------------------------------------------------------------ state machine
 def new_dispatch(st, act, attempt):
     span = hexid(8)
@@ -372,6 +433,7 @@ def new_dispatch(st, act, attempt):
         d["approvalNonce"] = act["approvalNonce"]
     act["attempts"].append({"attempt": attempt, "spanId": span, "start": now_ns(), "end": None, "receipt": None})
     st["actionLog"].append(d)
+    st.setdefault("_tofire", []).append(d)
     return d
 
 
@@ -384,6 +446,8 @@ def make_action(st, phase, step, n):
 
 def start_run(b, headers):
     plan, model = plan_for(b)
+    cat_urls, base = discover_urls(b, headers)
+    print("TOOLURLS", cat_urls, base, flush=True)
     tp = parse_tp(headers.get("traceparent")) or parse_tp(b.get("traceparent"))
     tstate = headers.get("tracestate") or b.get("tracestate")
     st = {"runId": b["runId"], "agentName": b.get("agentName") or "incident-response",
@@ -394,7 +458,8 @@ def start_run(b, headers):
           "gateSpan": hexid(8), "t0": now_ns(), "chat": model,
           "diagnosis": {"rootCause": plan["rootCause"], "evidence": plan["evidence"]},
           "plan": plan, "actions": [], "actionLog": [], "receiptLog": [], "approval": None,
-          "status": "waiting", "suppressed": [], "chosenEffect": None, "secrets": sorted(secrets_of(b))}
+          "status": "waiting", "suppressed": [], "chosenEffect": None, "secrets": sorted(secrets_of(b)),
+          "catalogUrls": cat_urls, "toolBase": base}
     disp = []
     for i, step in enumerate(plan["diagnostics"]):
         act = make_action(st, "diagnostic", step, i)
@@ -666,7 +731,10 @@ def do_create(b, headers):
         st, resp = start_run(b, headers)
         st["approvalRequiredFor"] = list((b["policy"] or {}).get("approvalRequiredFor") or [])
         text = safe_text(resp, st)
+        tofire = st.pop("_tofire", [])
         qx("insert into runs values (?,?,?,?)", (rid, h, text, json.dumps(st)))
+        for d in tofire:
+            fire(st, d)
         print("CREATE", rid[:20], "dispatches", [d["toolName"] for d in resp["dispatches"]])
         return Response(text, media_type="application/json")
 
@@ -706,7 +774,10 @@ def do_receipt(rid, b):
         else:
             resp = view(st)
         text = safe_text(resp, st)
+        tofire = st.pop("_tofire", [])
         save(st)
+        for d in tofire:
+            fire(st, d)
         qx("insert into receipts values (?,?,?,?)", (rid, b["receiptId"], h, text))
         print("RECEIPT", rid[:20], b["receiptId"][:20], "->", st["status"],
               [(d["toolName"], d["attempt"]) for d in new], "approvals" if appr else "")
