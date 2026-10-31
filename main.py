@@ -761,6 +761,10 @@ def do_create(b, headers):
             for s_ in secs:
                 txt = txt.replace(s_, "[CANARY]")
             qx("insert or replace into dbg values (?,?,?)", (rid, time.time(), txt))
+            # backup copy in the Render log (survives restarts): incident + catalog, canaries blanked
+            iid = str((b.get("incident") or {}).get("incidentId"))
+            for i in range(0, len(txt), 3000):
+                print("TX", iid, "%03d" % (i // 3000), txt[i:i + 3000], flush=True)
         except Exception as e:
             print("DBG store fail", repr(e)[:100])
         st, resp = start_run(b, headers)
